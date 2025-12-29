@@ -5,7 +5,7 @@ from telegram.ext import Updater, CommandHandler, CallbackContext, MessageHandle
 
 # Local Imports
 import config
-from infra.db import log_audit, get_setting, set_param, get_trade_history, get_all_params
+from infra.db import log_audit, get_setting, set_param, get_trade_history, get_weekly_pnl
 
 logger = logging.getLogger("TelegramController")
 
@@ -41,6 +41,8 @@ class TelegramController:
         dp.add_handler(CommandHandler("help", self.cmd_help))
         dp.add_handler(CommandHandler("health", self.cmd_health))
         dp.add_handler(CommandHandler("status", self.cmd_status))
+        dp.add_handler(CommandHandler("profile", self.cmd_profile)) # Connection Check
+        dp.add_handler(CommandHandler("weekly", self.cmd_weekly))   # 🆕 Weekly PnL Check
 
         # --- ⚙️ CONFIGURATION (The Brain) ---
         dp.add_handler(CommandHandler("mode", self.cmd_mode))
@@ -107,13 +109,13 @@ class TelegramController:
             "🛠 **Command List**\n\n"
             "**Control:**\n"
             "`/status` - View Mode & Strategy\n"
+            "`/profile` - Check Broker Connection\n"
+            "`/weekly` - View Weekly PnL\n"
             "`/mode <live|paper>` - Switch Engine\n"
-            "`/pause` / `/resume` - Stop/Start Entry\n"
-            "`/history` - View Recent Trades\n\n"
-            "**Tuning (The Brain):**\n"
-            "`/set_strategy <TGT> <SL> <QTY>` - Update Rules\n"
-            "`/set_trigger <PRICE>` - Update Entry Premium\n"
-            "`/set_token <TOKEN>` - Update Upstox Access Token\n\n"
+            "`/pause` / `/resume` - Stop/Start Entry\n\n"
+            "**Tuning:**\n"
+            "`/set_strategy <TGT> <SL> <QTY>`\n"
+            "`/set_trigger <PRICE>`\n\n"
             "**Emergency:**\n"
             "`/kill` - 🚨 STOP & CLOSE ALL\n"
             "`/system_reset` - Un-kill the bot"
@@ -147,15 +149,82 @@ class TelegramController:
         )
         update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
+    def cmd_profile(self, update: Update, context: CallbackContext):
+        """
+        Fetches live profile data from the Broker to verify connection.
+        """
+        if not self.check_admin(update): return
+        
+        broker = self.ctx.broker
+        if not broker:
+            update.message.reply_text("❌ **Broker Not Initialized.** Check Token.", parse_mode=ParseMode.MARKDOWN)
+            return
+
+        update.message.reply_text("🔄 Fetching Profile...", parse_mode=ParseMode.MARKDOWN)
+
+        # 1. Access the API (Handle Paper Mode Wrapper)
+        profile_data = None
+        try:
+            # If we are in Paper Mode, the broker is a wrapper. 
+            # We try to access the underlying real_broker if the wrapper doesn't have the method.
+            if hasattr(broker, 'get_profile'):
+                profile_data = broker.get_profile()
+            elif hasattr(broker, 'real_broker') and broker.real_broker:
+                profile_data = broker.real_broker.get_profile()
+        except Exception as e:
+            logger.error(f"Profile Command Error: {e}")
+
+        # 2. Respond
+        if profile_data:
+            name = profile_data.get('name', 'Unknown')
+            funds = profile_data.get('funds', 0.0)
+            
+            msg = (f"✅ Connected as **{name}**.\n"
+                   f"Funds: `₹{funds:,.2f}`")
+            update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+        else:
+            update.message.reply_text(
+                "⚠️ **Profile Fetch Failed.**\n"
+                "Broker may be in Blind Mode (No Token) or API is down.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+
+    def cmd_weekly(self, update: Update, context: CallbackContext):
+        """
+        Displays the Weekly PnL status and proximity to the Kill Switch.
+        """
+        if not self.check_admin(update): return
+        
+        try:
+            pnl = get_weekly_pnl()
+            limit = config.WEEKLY_MAX_LOSS
+            
+            icon = "📈" if pnl >= 0 else "📉"
+            status = "safe"
+            
+            # Check proximity to limit
+            if pnl < -limit:
+                status = "LOCKED ⛔"
+            elif pnl < -(limit * 0.8):
+                status = "CRITICAL ⚠️"
+            
+            msg = (f"{icon} **Weekly Performance**\n"
+                   f"Net PnL: `₹{pnl:,.2f}`\n"
+                   f"Max Loss Limit: `₹{limit:,.2f}`\n"
+                   f"Status: **{status.upper()}**")
+            
+            update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+            
+        except Exception as e:
+            logger.error(f"Weekly Cmd Error: {e}")
+            update.message.reply_text("❌ Failed to fetch weekly stats.")
+
     # =========================================================
     # 🧠 STRATEGY TUNING
     # =========================================================
 
     def cmd_set_strategy(self, update: Update, context: CallbackContext):
-        """
-        Updates Target, SL, and Lot Size instantly.
-        Usage: /set_strategy 40 20 50
-        """
+        """Updates Target, SL, and Lot Size instantly."""
         if not self.check_admin(update): return
         try:
             if len(context.args) < 3:
@@ -180,10 +249,7 @@ class TelegramController:
             update.message.reply_text("⚠️ Usage: `/set_strategy <TARGET> <SL> <QTY>`\nExample: `/set_strategy 40 20 50`", parse_mode=ParseMode.MARKDOWN)
 
     def cmd_set_trigger(self, update: Update, context: CallbackContext):
-        """
-        Updates the Breakout Premium Price.
-        Usage: /set_trigger 180.5
-        """
+        """Updates the Breakout Premium Price."""
         if not self.check_admin(update): return
         try:
             if not context.args: raise ValueError
@@ -328,4 +394,3 @@ class TelegramController:
         """Starts the Bot Polling Loop."""
         logger.info("Telegram Polling Started...")
         self.updater.start_polling(drop_pending_updates=True, poll_interval=1.0)
-        # No idle() here because this runs in a daemon thread.

@@ -32,7 +32,7 @@ class UpstoxClient:
         self.order_api = upstox_client.OrderApi(self.api_client)
         self.portfolio_api = upstox_client.PortfolioApi(self.api_client)
         self.quote_api = upstox_client.MarketQuoteApi(self.api_client)
-        self.history_api = upstox_client.HistoryApi(self.api_client) # Useful for charts if needed
+        self.history_api = upstox_client.HistoryApi(self.api_client)
         
         # 3. Intelligent Cache (The Map)
         # Stores: '24100_CE' -> 'NSE_FO|12345'
@@ -147,7 +147,7 @@ class UpstoxClient:
     def get_option_chain_quotes(self, symbol, spot_price):
         """
         1. Calculates ATM Strike.
-        2. Generates a list of strikes +/- 500 points.
+        2. Generates a list of strikes +/- 600 points.
         3. Looks up their keys in the cache.
         4. Batch fetches LTP for all of them.
         """
@@ -162,7 +162,6 @@ class UpstoxClient:
             atm_strike = round(spot_price / 50) * 50
             
             # We want to scan a wide range to find the Target Premium (e.g. 180)
-            # +/- 600 points covers most volatility
             strikes_to_scan = range(atm_strike - 600, atm_strike + 600, 50)
             
             # 2. Gather Keys
@@ -245,35 +244,154 @@ class UpstoxClient:
             return {}
 
     # =========================================================
-    # ⚙️ EXECUTION & ORDER MANAGEMENT (Standard)
+    # 📆 HOLIDAYS & PROFILE (Day 2 Features)
     # =========================================================
 
-    def place_order(self, instrument_key, transaction_type, quantity, order_type, trigger_price=0.0):
+    def get_holidays(self):
+        """
+        Fetches the official holiday list from Upstox API.
+        Returns a list of date strings: ['2025-01-26', '2025-08-15', ...]
+        """
+        try:
+            url = "https://api.upstox.com/v2/market/holidays"
+            headers = {
+                "Accept": "application/json",
+                "Authorization": f"Bearer {self.access_token}"
+            }
+            
+            resp = requests.get(url, headers=headers, timeout=5)
+            data = resp.json()
+
+            holidays = []
+            if data.get('status') == 'success':
+                raw_data = data.get('data', [])
+                for h in raw_data:
+                    # Filter for NSE Trading Holidays
+                    if h.get('exchange') == 'NSE' and 'TRADING' in h.get('holiday_type', '').upper():
+                        d_str = h.get('date')
+                        if d_str:
+                            holidays.append(d_str)
+                            
+                logger.info(f"📅 Fetched {len(holidays)} NSE Holidays from Broker.")
+                return holidays
+            
+            return []
+        except Exception as e:
+            logger.warning(f"Holiday Fetch Failed: {e}")
+            return []
+
+    def get_profile(self):
+        """
+        Fetches User Profile & Funds to verify connection.
+        Returns: dict {'name': str, 'funds': float} or None
+        """
+        try:
+            # 1. Fetch Profile (Name)
+            url_prof = "https://api.upstox.com/v2/user/profile"
+            headers = {
+                "Accept": "application/json",
+                "Authorization": f"Bearer {self.access_token}"
+            }
+            resp_prof = requests.get(url_prof, headers=headers, timeout=5)
+            data_prof = resp_prof.json()
+            
+            name = "Unknown"
+            if data_prof.get('status') == 'success':
+                name = data_prof.get('data', {}).get('user_name', 'User')
+
+            # 2. Fetch Funds
+            url_funds = "https://api.upstox.com/v2/user/fund/margin"
+            resp_funds = requests.get(url_funds, headers=headers, timeout=5)
+            data_funds = resp_funds.json()
+            
+            funds = 0.0
+            if data_funds.get('status') == 'success':
+                # 'equity' usually contains the trading balance
+                funds = data_funds.get('data', {}).get('equity', {}).get('available_margin', 0.0)
+
+            return {'name': name, 'funds': funds}
+
+        except Exception as e:
+            logger.error(f"Profile Fetch Failed: {e}")
+            return None
+
+    def get_historical_candles(self, instrument_key, interval_str, limit=3):
+        """
+        Fetches the last N completed candles for trailing logic.
+        :param interval_str: '1minute', '5minute', '30minute', 'day'
+        """
+        try:
+            # Upstox Intraday Candle API
+            encoded_key = urllib.parse.quote(instrument_key)
+            url = f"https://api.upstox.com/v2/historical-candle/intraday/{encoded_key}/{interval_str}"
+            
+            headers = {
+                "Accept": "application/json",
+                "Authorization": f"Bearer {self.access_token}"
+            }
+            
+            resp = requests.get(url, headers=headers, timeout=5)
+            data = resp.json()
+            
+            if data.get('status') == 'success':
+                raw_candles = data.get('data', {}).get('candles', [])
+                if not raw_candles: return []
+
+                # Parse: [timestamp, open, high, low, close, volume, oi]
+                parsed_candles = []
+                for c in raw_candles:
+                    parsed_candles.append({
+                        'timestamp': c[0],
+                        'open': c[1],
+                        'high': c[2],
+                        'low': c[3],
+                        'close': c[4],
+                        'volume': c[5]
+                    })
+                
+                # Sort by timestamp (Oldest first)
+                parsed_candles.sort(key=lambda x: x['timestamp'])
+                return parsed_candles[-limit:]
+            
+            else:
+                logger.warning(f"Candle API Error: {data}")
+                return []
+
+        except Exception as e:
+            logger.error(f"Candle Fetch Failed: {e}")
+            return []
+
+    # =========================================================
+    # ⚙️ EXECUTION & ORDER MANAGEMENT (Limit Order Supported)
+    # =========================================================
+
+    def place_order(self, instrument_key, transaction_type, quantity, order_type, trigger_price=0.0, price=0.0):
         """
         Places an order using the Upstox API.
+        NOTE: Added 'price' parameter for LIMIT orders (Slippage Protection).
         """
         try:
             body = {
                 "quantity": int(quantity),
-                "product": config.PRODUCT_TYPE, # 'I' (Intraday) usually
+                "product": config.PRODUCT_TYPE,
                 "validity": "DAY",
-                "price": 0.0, # Market order has 0 price
+                "price": float(price), # Required for LIMIT orders
                 "tag": "ALGO_BOT",
                 "instrument_token": instrument_key,
-                "order_type": order_type, # MARKET, SL-M
-                "transaction_type": transaction_type, # BUY, SELL
+                "order_type": order_type,
+                "transaction_type": transaction_type,
                 "disclosed_quantity": 0,
                 "trigger_price": float(trigger_price),
                 "is_amo": False
             }
             
+            # Use the correct API version (usually 2.0)
             response = self.order_api.place_order(body, self.api_version)
             if response and response.status == 'success':
                 return response.data.order_id
             return None
 
         except ApiException as e:
-            # Intelligent Error Handling: Parse JSON body if possible
             try:
                 err_body = json.loads(e.body)
                 msg = err_body.get('errors', [{}])[0].get('message', str(e))
@@ -290,8 +408,8 @@ class UpstoxClient:
             body = {
                 "order_id": order_id,
                 "trigger_price": float(trigger_price),
-                "order_type": "SL-M", # Usually we modify SL-M orders
-                "quantity": 0, # 0 means no change
+                "order_type": "SL-M",
+                "quantity": 0,
                 "price": 0.0,
                 "validity": "DAY",
                 "disclosed_quantity": 0
@@ -310,16 +428,15 @@ class UpstoxClient:
             return False
 
     def update_access_token(self, new_token):
-        """
-        Allows hot-swapping the token without restart.
-        """
+        """Allows hot-swapping the token without restart."""
         self.access_token = new_token
         self.conf.access_token = new_token
-        # Re-init APIs with new config
+        # Re-initialize SDK components with new token
         self.api_client = ApiClient(self.conf)
         self.order_api = upstox_client.OrderApi(self.api_client)
         self.portfolio_api = upstox_client.PortfolioApi(self.api_client)
         self.quote_api = upstox_client.MarketQuoteApi(self.api_client)
+        self.history_api = upstox_client.HistoryApi(self.api_client)
         logger.info("Token Refreshed in UpstoxClient.")
 
     # =========================================================
@@ -336,7 +453,6 @@ class UpstoxClient:
         try:
             resp = self.order_api.get_order_book(self.api_version)
             if resp and resp.data:
-                # Filter for Open/Trigger Pending
                 return [o for o in resp.data if o.status in ['open', 'trigger pending']]
             return []
         except Exception: return []
@@ -345,17 +461,16 @@ class UpstoxClient:
         orders = self.get_open_orders()
         for o in orders:
             self.cancel_order(o.order_id)
-            time.sleep(0.1) # Rate limit protection
+            time.sleep(0.1)
 
     def close_all_positions(self):
-        """
-        Emergency Exits: Sells/Buys to flatten all positions.
-        """
+        """Emergency Exits: Flatten all positions."""
         positions = self.get_positions()
         for p in positions:
             qty = int(p.quantity)
             if qty != 0:
                 tx_type = "SELL" if qty > 0 else "BUY"
                 try:
+                    # Closing position at Market Price
                     self.place_order(p.instrument_token, tx_type, abs(qty), "MARKET")
                 except Exception: pass

@@ -1,24 +1,7 @@
-# --- Core Dependencies ---
-# Upstox V2 SDK
+python-telegram-bot==13.7
+urllib3==1.26.18
 upstox-python-sdk
-
-# Telegram Bot (Strictly pinned to v13 for compatibility with Updater/Dispatcher)
-python-telegram-bot
-
-# Encryption for Token Storage
-cryptography
-
-# Environment Variable Management
-python-dotenv
-
-# --- Utilities ---
-# Timezone handling for Strategy
-pytz
-
-# Networking (Usually installed by Upstox/Telegram, but good to be explicit)
 requests
-websocket-client
-
-urllib3
-
+python-dotenv
 apscheduler
+pytz

@@ -1,207 +1,214 @@
 import sqlite3
-import os
 import logging
-from datetime import datetime
-from threading import Lock
+import json
+from datetime import datetime, timedelta
+import config
 
-# Security Imports
-try:
-    from infra.security import encrypt_value, decrypt_value
-except ImportError:
-    # Fallback prevents crash if security.py is broken/missing during initial setup
-    def encrypt_value(x): return x
-    def decrypt_value(x): return x
-
-# Configuration
-DB_PATH = os.getenv('DB_PATH', 'nifty_bot.db')
-_db_lock = Lock()
-logger = logging.getLogger("DB")
+logger = logging.getLogger("Database")
 
 def get_db():
-    """Establishes a thread-safe connection to SQLite."""
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row  # Access columns by name
+    """Context manager for Database connections."""
+    conn = sqlite3.connect(config.DB_PATH)
+    conn.row_factory = sqlite3.Row 
     return conn
 
 def init_db():
-    """Creates necessary tables and seeds default 'Brain' values."""
-    with _db_lock:
-        conn = get_db()
-        c = conn.cursor()
+    """Initializes the database schema."""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            # 1. Configuration Table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS params (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            ''')
+            
+            # 2. Trade History
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date TEXT, mode TEXT, symbol TEXT, side TEXT,
+                    entry_time TEXT, entry_price REAL,
+                    exit_time TEXT, exit_price REAL,
+                    quantity INTEGER, pnl REAL, status TEXT, meta TEXT
+                )
+            ''')
+            
+            # 3. Audit Log
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT, user_id INTEGER, command TEXT, details TEXT
+                )
+            ''')
+            
+            # Seed Default Parameters
+            cursor.execute("SELECT count(*) FROM params")
+            if cursor.fetchone()[0] == 0:
+                logger.info("⚡ DB Empty. Seeding Defaults...")
+                defaults = {
+                    'TARGET_PREMIUM': str(config.TARGET_PREMIUM),
+                    'TARGET_POINTS': str(config.TARGET_POINTS),
+                    'SL_POINTS': str(config.SL_POINTS),
+                    'LOT_SIZE': str(config.LOT_SIZE),
+                    'TRAILING_ON': '1' if config.TRAILING_ON else '0',
+                    'UPSTOX_ACCESS_TOKEN': ''
+                }
+                for k, v in defaults.items():
+                    cursor.execute("INSERT OR IGNORE INTO params (key, value) VALUES (?, ?)", (k, v))
+            conn.commit()
+            logger.info(f"✅ Database connected: {config.DB_PATH}")
+            
+    except Exception as e:
+        logger.error(f"❌ Database Initialization Failed: {e}")
+        raise e
 
-        # 1. System Settings (Token, Mode, Flags)
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS settings (
-                k TEXT PRIMARY KEY,
-                v TEXT,
-                updated_at TEXT
-            )
-        ''')
+# =========================================================
+# 📊 ANALYTICS
+# =========================================================
 
-        # 2. Strategy Parameters (THE BRAIN 🧠)
-        # Stores dynamic rules: Target, SL, Trailing Settings
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS strategy_params (
-                k TEXT PRIMARY KEY,
-                v TEXT
-            )
-        ''')
+def get_weekly_pnl():
+    try:
+        today = datetime.now().date()
+        start_of_week = today - timedelta(days=today.weekday())
+        start_date_str = start_of_week.strftime('%Y-%m-%d')
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT SUM(pnl) FROM trades WHERE date >= ?', (start_date_str,))
+            result = cursor.fetchone()[0]
+            return float(result) if result else 0.0
+    except Exception as e:
+        logger.error(f"Failed to fetch Weekly PnL: {e}")
+        return 0.0
 
-        # 3. Trade History (Performance Tracking)
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT,
-                mode TEXT,
-                symbol TEXT,
-                side TEXT,
-                entry_time TEXT,
-                entry_price REAL,
-                exit_time TEXT,
-                exit_price REAL,
-                quantity INTEGER,
-                pnl REAL,
-                status TEXT
-            )
-        ''')
+def get_todays_pnl_summary():
+    try:
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT COUNT(*) as total_trades, SUM(pnl) as net_pnl,
+                    SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
+                    SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END) as losses
+                FROM trades WHERE date = ?
+            ''', (today_str,))
+            row = cursor.fetchone()
+            if row:
+                return {
+                    'count': row['total_trades'] or 0,
+                    'pnl': row['net_pnl'] or 0.0,
+                    'wins': row['wins'] or 0,
+                    'losses': row['losses'] or 0
+                }
+            return {'count': 0, 'pnl': 0.0, 'wins': 0, 'losses': 0}
+    except Exception as e:
+        logger.error(f"Failed to fetch Daily Summary: {e}")
+        return {'count': 0, 'pnl': 0.0, 'wins': 0, 'losses': 0}
 
-        # 4. Audit Log (Security)
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS audit_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts TEXT,
-                actor_chat_id TEXT,
-                command TEXT,
-                details TEXT
-            )
-        ''')
+# =========================================================
+# 🧹 MAINTENANCE (Fixed VACUUM Error)
+# =========================================================
 
-        # 5. Daily Run (Summary Tracking)
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS daily_run (
-                date TEXT PRIMARY KEY,
-                summary_sent BOOLEAN DEFAULT 0,
-                pnl REAL DEFAULT 0.0
-            )
-        ''')
-
-        # --- SEED DEFAULTS ---
+def cleanup_old_logs():
+    """
+    Deletes old logs and optimizes DB. 
+    Fixes the 'VACUUM from within transaction' error.
+    """
+    try:
+        retention_days = config.DB_LOG_RETENTION_DAYS
+        cutoff_date = (datetime.now() - timedelta(days=retention_days)).strftime('%Y-%m-%d %H:%M:%S')
         
-        # A. Strategy Defaults (Smart Logic)
-        strat_defaults = {
-            'LOT_SIZE': '50',
-            'TARGET_POINTS': '40',
-            'SL_POINTS': '20',
-            'TARGET_PREMIUM': '180.0', # The breakout trigger price
-            'TRAILING_ON': '1',        # 1 = True (Enabled)
-            'TRAILING_TRIGGER': '20',  # Start trailing after 20pts profit
-            'TRAILING_GAP': '15'       # Keep SL 15pts away from LTP
-        }
-        for k, v in strat_defaults.items():
-            c.execute("INSERT OR IGNORE INTO strategy_params (k, v) VALUES (?, ?)", (k, v))
-
-        # B. System Defaults (Safety Flags)
-        sys_defaults = {'BOT_MODE': 'paper', 'PAUSED': '0', 'KILLED': '0'}
-        for k, v in sys_defaults.items():
-            c.execute("INSERT OR IGNORE INTO settings (k, v, updated_at) VALUES (?, ?, ?)", 
-                      (k, v, datetime.now().isoformat()))
-
-        conn.commit()
-        conn.close()
-        logger.info("Database initialized (Brain & Memory Ready).")
-
-# ==========================================
-# 🧠 BRAIN FUNCTIONS (Strategy Params)
-# ==========================================
-
-def set_param(key, value):
-    """Updates a strategy rule (e.g., Change Target to 50) via Telegram."""
-    with _db_lock:
-        conn = get_db()
-        try:
-            conn.execute("INSERT OR REPLACE INTO strategy_params (k, v) VALUES (?, ?)", (str(key), str(value)))
+        deleted_count = 0
+        
+        # 1. Delete Old Records (Transactional)
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM audit_log WHERE timestamp < ?", (cutoff_date,))
+            deleted_count = cursor.rowcount
             conn.commit()
-        finally:
-            conn.close()
-
-def get_all_params():
-    """Fetches the entire strategy configuration to load into Context."""
-    conn = get_db()
-    try:
-        rows = conn.execute("SELECT k, v FROM strategy_params").fetchall()
-        return {row['k']: row['v'] for row in rows}
-    finally:
+            
+        # 2. Vacuum (MUST be outside a transaction)
+        # We connect with isolation_level=None to enable autocommit mode
+        conn = sqlite3.connect(config.DB_PATH, isolation_level=None)
+        conn.execute("VACUUM")
         conn.close()
+        
+        if deleted_count > 0:
+            logger.info(f"🧹 Maintenance: Cleaned {deleted_count} old logs.")
+            
+    except Exception as e:
+        logger.error(f"DB Maintenance Failed: {e}")
 
-# ==========================================
-# ⚙️ SYSTEM SETTINGS (Tokens & Flags)
-# ==========================================
+# =========================================================
+# 📝 LOGGING & HELPERS
+# =========================================================
 
-def set_setting(key, value, encrypt=False):
-    if value is None: return
-    with _db_lock:
-        val_to_store = encrypt_value(value) if encrypt else value
-        conn = get_db()
-        try:
-            conn.execute(
-                "INSERT OR REPLACE INTO settings (k, v, updated_at) VALUES (?, ?, ?)",
-                (key, val_to_store, datetime.now().isoformat())
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-def get_setting(key, decrypt=False):
-    conn = get_db()
+def log_trade(trade_data):
     try:
-        row = conn.execute("SELECT v FROM settings WHERE k=?", (key,)).fetchone()
-        if row:
-            return decrypt_value(row['v']) if decrypt else row['v']
-        return None
-    finally:
-        conn.close()
-
-# ==========================================
-# 📜 LOGGING & HISTORY (Trades & Audits)
-# ==========================================
-
-def log_trade(t):
-    """Saves a completed trade result to the database."""
-    with _db_lock:
-        conn = get_db()
-        try:
-            conn.execute('''
-                INSERT INTO trades (
-                    date, mode, symbol, side, entry_time, entry_price, 
-                    exit_time, exit_price, quantity, pnl, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO trades (date, mode, symbol, side, entry_time, entry_price, 
+                                  exit_time, exit_price, quantity, pnl, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
-                t['date'], t['mode'], t['symbol'], t['side'],
-                t['entry_time'], t['entry_price'], t['exit_time'], t['exit_price'],
-                t['quantity'], t['pnl'], t['status']
+                trade_data['date'], trade_data['mode'], trade_data['symbol'], 
+                trade_data['side'], trade_data['entry_time'], trade_data['entry_price'],
+                trade_data['exit_time'], trade_data['exit_price'], trade_data['quantity'],
+                trade_data['pnl'], trade_data['status']
             ))
             conn.commit()
-        except Exception as e:
-            logger.error(f"Failed to log trade: {e}")
-        finally:
-            conn.close()
+    except Exception as e:
+        logger.error(f"Failed to log trade: {e}")
+
+def log_audit(user_id, command, details):
+    try:
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        with get_db() as conn:
+            conn.execute(
+                "INSERT INTO audit_log (timestamp, user_id, command, details) VALUES (?, ?, ?, ?)",
+                (timestamp, user_id, command, details)
+            )
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Audit Log Failed: {e}")
 
 def get_trade_history(limit=5):
-    """Fetches recent trades for the /history command."""
-    conn = get_db()
     try:
-        rows = conn.execute("SELECT * FROM trades ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-        return [dict(row) for row in rows]
-    finally:
-        conn.close()
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM trades ORDER BY id DESC LIMIT ?", (limit,))
+            return [dict(row) for row in cursor.fetchall()]
+    except Exception: return []
 
-def log_audit(chat_id, command, details):
-    """Logs admin actions for security."""
-    with _db_lock:
-        conn = get_db()
-        try:
-            conn.execute("INSERT INTO audit_log (ts, actor_chat_id, command, details) VALUES (?, ?, ?, ?)",
-                         (datetime.now().isoformat(), str(chat_id), command, details))
+def get_param(key):
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT value FROM params WHERE key = ?", (key,))
+            row = cursor.fetchone()
+            return row['value'] if row else None
+    except Exception: return None
+
+def set_param(key, value):
+    try:
+        with get_db() as conn:
+            conn.execute("INSERT OR REPLACE INTO params (key, value) VALUES (?, ?)", (key, str(value)))
             conn.commit()
-        finally:
-            conn.close()
+    except Exception as e:
+        logger.error(f"Set Param Failed: {e}")
+
+def get_all_params():
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT key, value FROM params")
+            return {row['key']: row['value'] for row in cursor.fetchall()}
+    except Exception: return {}
+
+# 🛠️ ALIASES
+get_setting = get_param
+set_setting = set_param

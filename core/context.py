@@ -4,8 +4,8 @@ from datetime import datetime
 
 # --- Local Imports ---
 # We import 'get_all_params' to load the Strategy Rules (The Brain) from DB
+# We import 'get_setting' (alias for get_param) and 'set_setting' (alias for set_param)
 from infra.db import get_setting, set_setting, log_audit, get_all_params
-from infra.security import decrypt_value
 
 # Import the Simulation Engine
 from infra.paper_broker import PaperBroker
@@ -16,10 +16,16 @@ try:
 except ImportError:
     UpstoxClient = None
 
+# Import Strategy (The Brain)
+from core.strategy import NiftyStrategy
+
 logger = logging.getLogger("Context")
 
-class BotContext:
+class TradingContext:
     def __init__(self):
+        """
+        The Central Hub. Holds state, broker connection, and strategy.
+        """
         self.lock = threading.RLock()
         
         # --- System State ---
@@ -33,13 +39,17 @@ class BotContext:
         
         # --- Runtime Objects ---
         self.broker = None
-        self.kill_confirmations = {} # Safety mechanism for /kill command
+        self.strategy = None
+        self.kill_confirmations = {} # Stores 4-digit codes for kill command
         
         # --- Communication ---
         self._alert_callback = None
         
         # --- Startup Sequence ---
         self.reload_state()
+        
+        # Initialize Strategy Logic
+        self.strategy = NiftyStrategy(self)
 
     def set_alert_callback(self, callback_func):
         """Allows Strategy to send Telegram messages via Context."""
@@ -52,6 +62,8 @@ class BotContext:
                 self._alert_callback(message)
             except Exception as e:
                 logger.error(f"Failed to send alert: {e}")
+        else:
+            logger.warning(f"🔔 Alert (No Telegram): {message}")
 
     def reload_state(self):
         """
@@ -60,7 +72,9 @@ class BotContext:
         """
         with self.lock:
             # 1. Load System Flags from DB
-            self.mode = get_setting('BOT_MODE') or 'paper'
+            # Note: We use string '1'/'0' for booleans in DB to keep it simple
+            db_mode = get_setting('BOT_MODE')
+            self.mode = db_mode if db_mode in ['live', 'paper'] else 'paper'
             self.paused = (get_setting('PAUSED') == '1')
             self.killed = (get_setting('KILLED') == '1')
             
@@ -97,8 +111,7 @@ class BotContext:
             return
 
         # 1. Always attempt to create the Real Broker (We need it for Data Feed!)
-        token_enc = get_setting('UPSTOX_ACCESS_TOKEN', decrypt=False)
-        token = decrypt_value(token_enc) if token_enc else None
+        token = get_setting('UPSTOX_ACCESS_TOKEN')
         
         real_broker = None
         if token and UpstoxClient:
@@ -130,9 +143,8 @@ class BotContext:
     def update_runtime_token(self, new_token):
         """Called by /set_token. Updates DB and hot-swaps the broker session."""
         with self.lock:
-            # 1. Save new token securely
-            set_setting('UPSTOX_ACCESS_TOKEN', new_token, encrypt=True)
-            set_setting('TOKEN_UPDATED_AT', datetime.now().isoformat())
+            # 1. Save new token
+            set_setting('UPSTOX_ACCESS_TOKEN', new_token)
             
             # 2. Hot-Swap
             # If we are live, try to update the existing session to avoid downtime
@@ -156,6 +168,14 @@ class BotContext:
             self.mode = new_mode
             set_setting('BOT_MODE', new_mode)
             self._init_broker()
+            
+            # Reset Strategy State on Switch
+            if self.strategy:
+                self.strategy.active_position = None
+                self.strategy.entry_locked = False
+                self.strategy.trade_taken_today = False
+                logger.info("✨ Strategy State Reset.")
+            
             return True
 
     def toggle_pause(self, should_pause):
@@ -164,6 +184,8 @@ class BotContext:
             val = '1' if should_pause else '0'
             set_setting('PAUSED', val)
             self.paused = should_pause
+            status = "PAUSED" if self.paused else "RESUMED"
+            logger.info(f"⏯️ System {status}")
 
     # =========================================================
     # Safety & Emergency Mechanisms
@@ -188,6 +210,7 @@ class BotContext:
             logger.critical("🚨 EMERGENCY KILL INITIATED 🚨")
             set_setting('KILLED', '1')
             self.killed = True
+            self.paused = True
             
             if self.broker:
                 try:
@@ -214,7 +237,13 @@ class BotContext:
             logger.info("🔄 System Reset Initiated...")
             set_setting('KILLED', '0')
             self.killed = False
+            self.paused = False
             
             # Re-initialize broker to reconnect
             self._init_broker()
             logger.info("✅ System Reset Complete. Bot is Active.")
+            
+    def stop(self):
+        """Clean shutdown called by main.py signal handler."""
+        logger.info("Context stopping...")
+        # Add any necessary cleanup logic here if needed
