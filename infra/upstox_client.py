@@ -244,7 +244,7 @@ class UpstoxClient:
             return {}
 
     # =========================================================
-    # 📆 HOLIDAYS & PROFILE (Day 2 Features)
+    # 📆 HOLIDAYS & PROFILE (CRITICAL FIXES)
     # =========================================================
 
     def get_holidays(self):
@@ -283,31 +283,33 @@ class UpstoxClient:
     def get_profile(self):
         """
         Fetches User Profile & Funds to verify connection.
-        Returns: dict {'name': str, 'funds': float} or None
+        ✅ FIX: Uses /user/get-funds-and-margin for correct balance.
         """
         try:
-            # 1. Fetch Profile (Name)
-            url_prof = "https://api.upstox.com/v2/user/profile"
             headers = {
                 "Accept": "application/json",
                 "Authorization": f"Bearer {self.access_token}"
             }
+            
+            # 1. Fetch Profile (Name)
+            url_prof = "https://api.upstox.com/v2/user/profile"
             resp_prof = requests.get(url_prof, headers=headers, timeout=5)
-            data_prof = resp_prof.json()
             
             name = "Unknown"
-            if data_prof.get('status') == 'success':
-                name = data_prof.get('data', {}).get('user_name', 'User')
+            if resp_prof.status_code == 200:
+                name = resp_prof.json().get('data', {}).get('user_name', 'User')
 
-            # 2. Fetch Funds
-            url_funds = "https://api.upstox.com/v2/user/fund/margin"
-            resp_funds = requests.get(url_funds, headers=headers, timeout=5)
-            data_funds = resp_funds.json()
+            # 2. Fetch Funds (CORRECTED URL)
+            url_funds = "https://api.upstox.com/v2/user/get-funds-and-margin"
             
+            resp_funds = requests.get(url_funds, headers=headers, timeout=5)
             funds = 0.0
-            if data_funds.get('status') == 'success':
-                # 'equity' usually contains the trading balance
-                funds = data_funds.get('data', {}).get('equity', {}).get('available_margin', 0.0)
+            
+            if resp_funds.status_code == 200:
+                data = resp_funds.json()
+                # 'equity' -> 'available_margin' is what you can trade with
+                equity_data = data.get('data', {}).get('equity', {})
+                funds = equity_data.get('available_margin', 0.0)
 
             return {'name': name, 'funds': funds}
 

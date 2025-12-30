@@ -38,10 +38,26 @@ class PaperBroker:
         return {'CE': [], 'PE': []}
 
     def get_profile(self):
-        """Pass-through to Real Broker for /profile command."""
-        if self.real_broker and hasattr(self.real_broker, 'get_profile'):
-            return self.real_broker.get_profile()
-        return {'name': 'Paper User', 'funds': 100000.0}
+        """
+        🟢 FAKE UNLIMITED MONEY FOR SIMULATION.
+        Returns a fake balance of ₹10,00,000 so the strategy never stops 
+        due to 'Insufficient Funds', regardless of your real bank balance.
+        """
+        real_name = "Paper User"
+        
+        # Try to get your Real Name from Upstox just for cosmetics
+        if self.real_broker:
+            try:
+                prof = self.real_broker.get_profile()
+                if prof:
+                    real_name = prof.get('name', real_name)
+            except:
+                pass
+
+        return {
+            'name': f"{real_name} (PAPER)", 
+            'funds': 50000.0  # 🟢 10 Lakhs Fake Balance
+        }
 
     def get_historical_candles(self, instrument_key, interval_str, limit=3):
         """Pass-through to Real Broker for Candle-Based Trailing."""
@@ -67,7 +83,7 @@ class PaperBroker:
     def place_order(self, instrument_key, transaction_type, quantity, order_type, trigger_price=0.0, price=0.0):
         """
         Simulates placing an order.
-        NOTE: Added 'price' parameter to support Limit Orders.
+        NOTE: Supports Limit Orders to test Slippage Protection logic.
         """
         # 1. Generate a realistic Order ID
         order_id = f"PAPER_{uuid.uuid4().hex[:8].upper()}"
@@ -86,14 +102,14 @@ class PaperBroker:
             average_price = ltp
             self._update_internal_position(instrument_key, transaction_type, quantity, ltp)
 
-        # LIMIT ORDER: 
+        # LIMIT ORDER (Slippage Protection Logic): 
         # For BUY: If Limit Price >= LTP, it fills immediately (Marketable Limit).
         # For SELL: If Limit Price <= LTP, it fills immediately.
         elif order_type == 'LIMIT':
             limit_price = float(price)
             if transaction_type == 'BUY' and limit_price >= ltp:
                 status = 'complete'
-                average_price = ltp # You get filled at Market Price, not Limit Price (better fill)
+                average_price = ltp # You get filled at Market Price (Better Fill)
                 self._update_internal_position(instrument_key, transaction_type, quantity, ltp)
             elif transaction_type == 'SELL' and limit_price <= ltp:
                 status = 'complete'

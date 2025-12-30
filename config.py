@@ -89,7 +89,7 @@ MARKET_END_TIME = time(15, 30)
 TARGET_PREMIUM = 180.0   # The Breakout Trigger Price
 TARGET_POINTS = 40.0     # Target Profit Points
 SL_POINTS = 20.0         # Initial Stop Loss Points
-LOT_SIZE = 50            # Quantity (1 Lot)
+LOT_SIZE = 200            # Quantity (1 Lot)
 
 # Trailing Configuration
 TRAILING_ON = True       # Master switch for trailing logic
